@@ -16,6 +16,9 @@
 
 裝好以後，腳本有新版時 Tampermonkey 會自動更新。
 
+也可以用 [Violentmonkey](https://violentmonkey.github.io/)（Chrome、Edge、Firefox
+都有），安裝方式一樣，點安裝連結就好。
+
 ## Meta 圖片載入觀測（fna-replay）
 
 **安裝：** [fna-replay.user.js](https://github.com/orsmile/userscripts/raw/main/fna-replay.user.js)
