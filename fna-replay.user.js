@@ -2,7 +2,7 @@
 // @name         FNA replay
 // @name:zh-TW   Meta 圖片載入觀測
 // @namespace    gl-mt5000-tuning
-// @version      0.4.0
+// @version      0.5.0
 // @description  Replays the Meta images and videos you load against HiNet's FNA caches and logs how long a first and a repeat fetch take
 // @description:zh-TW 瀏覽 FB、IG、Threads 時，記錄圖片和影片載入要等多久，並比較尖峰與離峰時段
 // @match        https://www.facebook.com/*
@@ -17,7 +17,9 @@
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
 // @grant        GM_setClipboard
+// @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
+// @connect      stat.ripe.net
 // ==/UserScript==
 
 // While you browse, every few seconds one media object the page loaded (from
@@ -34,6 +36,8 @@
 // stored, never the URLs.  Results stay in Tampermonkey storage; the panel
 // (button at the bottom left, or the menu) compares peak and off-peak hours
 // and copies the rows as JSON or CSV.
+// Each row also carries the network (ASN) the browser is on, looked up from
+// RIPEstat every few minutes.  Only the ASN and its name are kept, not the IP.
 
 (function () {
     'use strict';
@@ -57,7 +61,26 @@
     // Verdicts need this many samples on each side; heatmap cells this many.
     const MIN_VERDICT = 20;
     const MIN_CELL = 3;
-    const VERSION = '0.4.0';
+    const VERSION = '0.5.0';
+    const NET_REFRESH_MS = 10 * 60000;
+    // Short names for Taiwanese ASNs, from TWNIC's registry (map.twnic.tw)
+    // and RIPE's AS names on 2026-11-01.  Any other ASN shows its registry
+    // holder name.
+    const AS_NAMES = {
+        // Telcos, fixed and mobile
+        3462: '中華電信 HiNet', 17421: '中華電信 emome',
+        9674: '遠傳', 4780: '遠傳 Seednet',
+        24158: '台灣大哥大', 131614: '台灣大哥大', 131647: '台灣大哥大', 131648: '台灣大哥大',
+        131649: '台灣大哥大', 131650: '台灣大哥大',
+        9924: '台灣固網', 4636: '台灣固網', 4747: '台灣固網',
+        17709: '亞太電信', 24154: '亞太電信', 24155: '亞太電信', 24157: '台灣之星',
+        9919: '新世紀資通', 24161: '新世紀資通', 7482: 'APOL', 18182: 'So-net',
+        131584: '台灣智慧光網',
+        // Cable operators
+        38841: '凱擘 kbro', 9416: '中嘉', 18042: '中嘉', 24166: '中嘉',
+        131596: '台灣寬頻 TBC', 18419: '大大寬頻', 18413: '大台北寬頻', 18049: '台基科 TINP',
+        17809: '大台中數位', 18429: '大新店寬頻', 9922: '新高雄寬頻',
+    };
 
     const W = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
     const site = location.hostname.replace(/^www\./, '');
@@ -66,6 +89,35 @@
     let paused = GM_getValue('paused', false);
     let busy = false;
     let lastRun = 0;
+    // Network the browser is on now: { asn, name }.  Kept in memory only, so
+    // a stale value from another network is never written into rows.
+    let net = null;
+
+    function ripe(path) {
+        return new Promise((resolve, reject) => GM_xmlhttpRequest({
+            method: 'GET',
+            url: `https://stat.ripe.net/data/${path}${path.includes('?') ? '&' : '?'}sourceapp=fna-replay`,
+            timeout: 15000,
+            anonymous: true,
+            onload: r => { try { resolve(JSON.parse(r.responseText).data); } catch (e) { reject(e); } },
+            onerror: reject,
+            ontimeout: reject,
+        }));
+    }
+
+    // The IP is used for the second lookup and then dropped.  It is the
+    // address RIPEstat sees, so a VPN or split routing can make it differ
+    // from the one Meta sees; the host Meta hands out tells that apart.
+    async function detectNet() {
+        try {
+            const ip = (await ripe('whats-my-ip/data.json')).ip;
+            const a = ((await ripe('prefix-overview/data.json?resource=' + encodeURIComponent(ip))).asns || [])[0];
+            net = a ? { asn: a.asn, name: AS_NAMES[a.asn] || a.holder } : { asn: '', name: '未知網路' };
+        } catch (e) {
+            net = { asn: '', name: '偵測失敗' };
+        }
+        ui.update(GM_getValue(KEY_ROWS, []));
+    }
 
     function isMedia(url) {
         let u;
@@ -158,7 +210,7 @@
         fna.hostname = (kind === 'video' ? 'video.' : 'scontent.') + node + '.fna.fbcdn.net';
         const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
         const ts = new Date().toISOString();
-        const base = { ts, id, site, kind, node, ctl_host: shortHost(u.hostname), isp: GM_getValue('isp', '') };
+        const base = { ts, id, site, kind, node, ctl_host: shortHost(u.hostname), asn: net.asn, as_name: net.name };
         const rows = [Object.assign({ test: 'page' }, base, item.page)];
         rows.push(Object.assign({ test: 'ctl' }, base, await timeFetch(u.href)));
         rows.push(Object.assign({ test: 'first' }, base, await timeFetch(fna.href)));
@@ -176,7 +228,7 @@
         // Only the visible tab samples: background tabs get their timers cut
         // to once a minute, and several tabs writing the shared row list at
         // once would overwrite each other's rows.
-        if (paused || busy || document.visibilityState !== 'visible' || !queue.length ||
+        if (paused || busy || !net || document.visibilityState !== 'visible' || !queue.length ||
             Date.now() - lastRun < MIN_GAP_MS) return;
         busy = true;
         lastRun = Date.now();
@@ -276,13 +328,32 @@
         };
     }
 
+    // Rows from before 0.5 have no asn; they group under their label, if any.
+    const netKey = r => r.asn ? 'AS' + r.asn : (r.as_name || r.isp || '未偵測');
+    const netLabel = r => r.asn ? `${r.as_name}（AS${r.asn}）` : (r.as_name || r.isp || '未偵測');
+
+    function networks(rows) {
+        const m = {};
+        for (const r of rows) {
+            if (r.test !== 'first') continue;
+            const k = netKey(r);
+            (m[k] = m[k] || { key: k, label: netLabel(r), samples: 0 }).samples++;
+        }
+        return Object.values(m).sort((a, b) => b.samples - a.samples);
+    }
+
     // ---- export ---------------------------------------------------------
 
     const CSV_COLS = ['ts', 'id', 'site', 'kind', 'node', 'ctl_host', 'test', 'status', 'ttfb', 'total', 'bytes', 'kbps',
-                      'xfer', 'sw', 'proto', 'isp'];
+                      'xfer', 'sw', 'proto', 'asn', 'as_name'];
+
+    function csvCell(v) {
+        const s = v === undefined || v === null ? '' : String(v);
+        return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    }
 
     function csvText(rows) {
-        return [CSV_COLS.join(',')].concat(rows.map(r => CSV_COLS.map(c => r[c] === undefined ? '' : r[c]).join(','))).join('\n');
+        return [CSV_COLS.join(',')].concat(rows.map(r => CSV_COLS.map(c => csvCell(r[c])).join(','))).join('\n');
     }
 
     function jsonText(rows) {
@@ -292,7 +363,7 @@
             exported_at: new Date().toISOString(),
             time_zone: Intl.DateTimeFormat().resolvedOptions().timeZone,
             utc_offset_min: -new Date().getTimezoneOffset(),
-            isp_label: GM_getValue('isp', ''),
+            network_now: net,
             peak_hours_local: [PEAK_START, PEAK_END],
             slow_ms: SLOW_MS,
             hinet_nodes: NODES,
@@ -305,10 +376,13 @@
                 ttfb_total: 'Milliseconds to the first byte and to the end of the body (cut at 4 MiB).',
                 status: 'HTTP status, or timeout (45 s) / err. page rows may have an empty status.',
                 xfer: 'Resource timing transferSize; 0 with bytes > 0 means the browser cache answered (excluded from page stats).',
-                isp: 'ISP label the user picked in the panel when the sample was taken; empty if unset.',
+                asn: 'Network the browser was on for the sample, from RIPEstat (whats-my-ip, then prefix-overview); as_name is a short name or the registry holder. A VPN or split routing can make Meta see a different network: compare ctl_host.',
                 summary: 'Computed by the script: page excludes browser-cache hits; slow means total >= slow_ms, or a failed replay.',
+                summary_by_network: 'The same summary over the rows of each network only.',
             },
+            networks: networks(rows),
             summary: summarize(rows),
+            summary_by_network: Object.fromEntries(networks(rows).map(n => [n.key, summarize(rows.filter(r => netKey(r) === n.key))])),
             rows,
         }, null, 1);
     }
@@ -326,16 +400,14 @@
         fail: `抓不到（錯誤）或等了 ${TIMEOUT_MS / 1000} 秒還沒抓完的次數，也算在慢的裡面。`,
         node: 'FNA 節點：Meta 放在各家網路業者機房裡的快取主機。名稱像 ftpe7-2，ftpe 是台北、fkhh 是高雄。Meta 會依你的網路業者分配。',
         host: 'Meta 分給你的圖片主機。用中華電信的人通常是 ftpe7、ftpe8 或 fkhh1，其他業者會拿到不同的名稱。',
-        isp: '選你現在用的網路業者。之後每一筆紀錄都會帶上這個標記，換網路（例如改用手機熱點）時記得改。',
-        heat: `每格是一小時（依你電腦的時間），顏色越深代表慢的比例越高。灰色代表該小時少於 ${MIN_CELL} 筆，還看不出來。滑過格子看詳細數字。`,
+        net: '自動偵測你現在連線所屬的網路（ASN，網路業者的編號），每 10 分鐘更新一次，換網路（例如改用手機熱點）也會跟著變。只保存業者編號和名稱，不保存 IP。\n有開 VPN 或分流時，Meta 看到的可能是另一個網路，可以對照下面「Meta 分給你的主機」。',
+        netfilter: '資料裡有不同網路時，可以只看其中一個，避免混在一起影響結論。預設是現在的網路。',
+        heat: `每格是一小時（依你電腦的時間），顏色越深代表慢的比例越高。虛線格代表該小時少於 ${MIN_CELL} 筆，還看不出來。滑過格子看詳細數字。`,
         verdict: `尖峰慢的比例 10% 以上、而且是離峰的兩倍以上，算「只有尖峰會卡」。兩邊都 10% 以上算「整天都會卡」，都低於 5% 算「沒有明顯卡頓」。每邊至少要 ${MIN_VERDICT} 筆。`,
         samples: '每幾秒抽一張你剛看到的圖或影片來量，一次算一筆。只記錄時間和大小，不記錄網址或內容。',
         json: '複製完整資料（含統計和每一筆紀錄）成 JSON，適合直接貼給 AI agent 分析。',
-        csv: '複製每一筆紀錄成 CSV（跟舊版欄位相同，多了 isp 欄），可以貼進試算表或給 agent。',
+        csv: '複製每一筆紀錄成 CSV（跟舊版欄位相同，多了 asn、as_name 兩欄網路資訊），可以貼進試算表或給 agent。',
     };
-
-    const ISPS = ['', '中華電信 HiNet', '中華電信 行動網路', '台灣大哥大', '遠傳', '亞太電信',
-                  '凱擘 kbro', '中嘉', '台灣固網', 'Seednet', '其他'];
 
     const CSS = `
 :host { all: initial; }
@@ -376,7 +448,6 @@
 .meta b { color: var(--tx); font-weight: 600; }
 select { font: inherit; color: var(--tx); background: var(--bg2); border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; }
 .term { border-bottom: 1px dotted var(--tx3); cursor: help; }
-.hint { color: var(--serious); }
 h2 { font-size: 13px; margin: 14px 0 6px; font-weight: 600; }
 .verdicts { display: grid; gap: 6px; }
 .v { display: flex; gap: 8px; align-items: flex-start; padding: 8px 10px; border-radius: 8px; background: var(--bg2); }
@@ -443,7 +514,8 @@ button.b.danger { color: var(--bad); }
     }
 
     const ui = (function () {
-        let shadow, root, badge, panel, tip, open = false;
+        // view: the network picked in the panel; null follows the current one.
+        let shadow, root, badge, panel, tip, open = false, view = null;
 
         function mount() {
             if (shadow || !document.body) return;
@@ -568,17 +640,27 @@ button.b.danger { color: var(--bad); }
                 h('th', null, term('失敗', 'fail'))), rows);
         }
 
-        function render(rows) {
+        function render(allRows) {
+            const nets = networks(allRows);
+            const nowKey = net && net.asn ? 'AS' + net.asn : null;
+            let key = view || nowKey || 'all';
+            if (key !== 'all' && !nets.some(n => n.key === key)) key = 'all';
+            const rows = key === 'all' ? allRows : allRows.filter(r => netKey(r) === key);
             const sum = summarize(rows);
-            const isp = GM_getValue('isp', '');
-            const sel = h('select', { onchange: e => { GM_setValue('isp', e.target.value); update(GM_getValue(KEY_ROWS, [])); } },
-                ISPS.map(v => { const o = h('option', { value: v }, v || '（請選擇）'); o.selected = v === isp; return o; }));
+            const total = allRows.filter(r => r.test === 'first').length;
+            const nowText = !net ? '偵測中…' : net.asn ? `${net.name}（AS${net.asn}）` : net.name;
+            const sel = nets.length > 1 && h('select', { onchange: e => { view = e.target.value; update(GM_getValue(KEY_ROWS, [])); } },
+                [{ key: 'all', label: '全部網路', samples: total }].concat(nets).map(n => {
+                    const o = h('option', { value: n.key }, `${n.label}　${n.samples} 筆`);
+                    o.selected = n.key === key;
+                    return o;
+                }));
             const top = sum.page_hosts.slice(0, 3)
                 .map(p => `${p.host}${p.operator ? `（${p.operator}）` : ''} ${p.n} 筆`).join('、') || '還沒有資料';
             const btnJson = h('button', { class: 'b primary', tip: TIPS.json,
-                onclick: e => { GM_setClipboard(jsonText(GM_getValue(KEY_ROWS, []))); flash(e.target, `已複製 ${sum.samples} 筆`); } }, '複製 JSON');
+                onclick: e => { GM_setClipboard(jsonText(GM_getValue(KEY_ROWS, []))); flash(e.target, `已複製 ${total} 筆`); } }, '複製 JSON');
             const btnCsv = h('button', { class: 'b', tip: TIPS.csv,
-                onclick: e => { GM_setClipboard(csvText(GM_getValue(KEY_ROWS, []))); flash(e.target, `已複製 ${sum.samples} 筆`); } }, '複製 CSV');
+                onclick: e => { GM_setClipboard(csvText(GM_getValue(KEY_ROWS, []))); flash(e.target, `已複製 ${total} 筆`); } }, '複製 CSV');
             const btnPause = h('button', { class: 'b', onclick: () => {
                 paused = !paused; GM_setValue('paused', paused); update(GM_getValue(KEY_ROWS, []));
             } }, paused ? '繼續記錄' : '暫停記錄');
@@ -596,7 +678,8 @@ button.b.danger { color: var(--bad); }
                 h('div', { class: 'hd' }, h('h1', null, 'Meta 圖片載入觀測'), h('span', { class: 'ver' }, 'v' + VERSION),
                     h('button', { class: 'x', title: '關閉', onclick: toggle }, '×')),
                 h('div', { class: 'meta' },
-                    term('網路業者', 'isp'), h('span', null, sel, isp ? '' : h('span', { class: 'hint' }, '　請先選擇')),
+                    term('目前網路', 'net'), h('b', null, nowText),
+                    sel && term('顯示資料', 'netfilter'), sel && h('span', null, sel),
                     term('Meta 分給你的主機', 'host'), h('b', null, top),
                     term('樣本', 'samples'), h('span', null, h('b', null, sum.samples), ` 筆，${localTime(sum.from)} 到 ${localTime(sum.to)}`,
                         paused ? '（已暫停）' : '')),
@@ -635,6 +718,10 @@ button.b.danger { color: var(--bad); }
 
     if (document.body) ui.mount();
     else document.addEventListener('DOMContentLoaded', () => ui.mount());
+
+    detectNet();
+    setInterval(detectNet, NET_REFRESH_MS);
+    W.addEventListener('online', detectNet);
 
     new W.PerformanceObserver(list => list.getEntries().forEach(onEntry))
         .observe({ type: 'resource', buffered: true });
