@@ -2,7 +2,7 @@
 // @name         FNA replay
 // @name:zh-TW   Meta 圖片載入觀測
 // @namespace    gl-mt5000-tuning
-// @version      0.5.0
+// @version      0.6.0
 // @description  Replays the Meta images and videos you load against HiNet's FNA caches and logs how long a first and a repeat fetch take
 // @description:zh-TW 瀏覽 FB、IG、Threads 時，記錄圖片和影片載入要等多久，並比較尖峰與離峰時段
 // @match        https://www.facebook.com/*
@@ -61,7 +61,9 @@
     // Verdicts need this many samples on each side; heatmap cells this many.
     const MIN_VERDICT = 20;
     const MIN_CELL = 3;
-    const VERSION = '0.5.0';
+    // Days shown in the per-day heatmap and table (the export keeps every day).
+    const DAY_ROWS = 14;
+    const VERSION = '0.6.0';
     const NET_REFRESH_MS = 10 * 60000;
     // Short names for Taiwanese ASNs, from TWNIC's registry (map.twnic.tw)
     // and RIPE's AS names on 2026-11-01.  Any other ASN shows its registry
@@ -298,6 +300,18 @@
             byHour.push({ hour: h, page: stat(page.filter(r => hourOf(r) === h)),
                           first: stat(first.filter(r => hourOf(r) === h)) });
         }
+        // Local calendar date; the peak window (20-24) never crosses midnight.
+        const dayOf = r => new Date(r.ts).toLocaleDateString('sv');
+        const days = [...new Set(first.map(dayOf))].sort();
+        const byDay = days.map(d => {
+            const dp = page.filter(r => dayOf(r) === d), df = first.filter(r => dayOf(r) === d);
+            const hours = [];
+            for (let h = 0; h < 24; h++) {
+                hours.push({ hour: h, page: stat(dp.filter(r => hourOf(r) === h)),
+                             first: stat(df.filter(r => hourOf(r) === h)) });
+            }
+            return { date: d, samples: df.length, page: split(dp), first: split(df), by_hour: hours };
+        });
         const hosts = {};
         for (const r of page) (hosts[r.ctl_host] = hosts[r.ctl_host] || []).push(r);
         const pageHosts = Object.keys(hosts)
@@ -323,6 +337,7 @@
             page: split(page),
             first: split(first),
             by_hour: byHour,
+            by_day: byDay,
             page_hosts: pageHosts,
             by_node: byNode,
         };
@@ -379,6 +394,7 @@
                 asn: 'Network the browser was on for the sample, from RIPEstat (whats-my-ip, then prefix-overview); as_name is a short name or the registry holder. A VPN or split routing can make Meta see a different network: compare ctl_host.',
                 summary: 'Computed by the script: page excludes browser-cache hits; slow means total >= slow_ms, or a failed replay.',
                 summary_by_network: 'The same summary over the rows of each network only.',
+                by_day: 'summary.by_day splits by local date (time_zone): per-day peak/off-peak split, verdict and 24 hourly cells.',
             },
             networks: networks(rows),
             summary: summarize(rows),
@@ -403,6 +419,7 @@
         net: '自動偵測你現在連線所屬的網路（ASN，網路業者的編號），每 10 分鐘更新一次，換網路（例如改用手機熱點）也會跟著變。只保存業者編號和名稱，不保存 IP。\n有開 VPN 或分流時，Meta 看到的可能是另一個網路，可以對照下面「Meta 分給你的主機」。',
         netfilter: '資料裡有不同網路時，可以只看其中一個，避免混在一起影響結論。預設是現在的網路。',
         heat: `每格是一小時（依你電腦的時間），顏色越深代表慢的比例越高。虛線格代表該小時少於 ${MIN_CELL} 筆，還看不出來。滑過格子看詳細數字。`,
+        days: `每一列是一天（依你電腦的時間），格子是 HiNet 節點補檔每小時超過 1 秒的比例，滑過去也會看到你實際等待的數字。下面的表格是每天尖峰和離峰超過 1 秒的比例，括號是筆數。最多顯示最近 ${DAY_ROWS} 天。`,
         verdict: `尖峰慢的比例 10% 以上、而且是離峰的兩倍以上，算「只有尖峰會卡」。兩邊都 10% 以上算「整天都會卡」，都低於 5% 算「沒有明顯卡頓」。每邊至少要 ${MIN_VERDICT} 筆。`,
         samples: '每幾秒抽一張你剛看到的圖或影片來量，一次算一筆。只記錄時間和大小，不記錄網址或內容。',
         json: '複製完整資料（含統計和每一筆紀錄）成 JSON，適合直接貼給 AI agent 分析。',
@@ -577,32 +594,68 @@ button.b.danger { color: var(--bad); }
                         `離峰 ${s.offpeak.n} 筆，超過 1 秒 ${rate(s.offpeak)}`)));
         }
 
-        function heatmap(sum) {
+        const cellDetail = s => s.n
+            ? `${s.n} 筆，超過 1 秒 ${s.slow} 筆（${s.slow_pct}%）\n中位數 ${ms(s.p50)}，P90 ${ms(s.p90)}` +
+              (s.fail ? `\n失敗或逾時 ${s.fail} 筆` : '')
+            : '沒有資料';
+
+        // lines: [{ label: Node|string, hours: by_hour-shaped array, tip: (bucket) => string }]
+        function heatGrid(lines) {
             const grid = h('div', { class: 'heat' });
             grid.append(h('div', { class: 'lbl', style: 'grid-row:1' }, ''));
             grid.append(h('div', { class: 'band', tip: TIPS.peak,
                 style: `grid-column:${PEAK_START + 2}/${PEAK_END + 2}` }, '尖峰'));
-            const rowsDef = [['你實際等待', 'page'], ['HiNet 節點補檔', 'first']];
-            rowsDef.forEach(([label, key], i) => {
-                grid.append(h('div', { class: 'lbl', style: `grid-row:${i + 2}` }, term(label, key)));
-                for (const b of sum.by_hour) {
-                    const s = b[key];
-                    const detail = s.n
-                        ? `${s.n} 筆，超過 1 秒 ${s.slow} 筆（${s.slow_pct}%）\n中位數 ${ms(s.p50)}，P90 ${ms(s.p90)}` +
-                          (s.fail ? `\n失敗或逾時 ${s.fail} 筆` : '')
-                        : '沒有資料';
-                    grid.append(h('div', { class: 'cell ' + heatClass(s), style: `grid-row:${i + 2}`,
-                        tip: `${hourRange(b.hour)}　${label}\n${detail}` }));
+            lines.forEach((ln, i) => {
+                grid.append(h('div', { class: 'lbl', style: `grid-row:${i + 2}` }, ln.label));
+                for (const b of ln.hours) {
+                    grid.append(h('div', { class: 'cell ' + heatClass(ln.stat(b)), style: `grid-row:${i + 2}`, tip: ln.tip(b) }));
                 }
             });
             for (let hr = 0; hr < 24; hr++) {
-                grid.append(h('div', { class: 'hr', style: `grid-row:4;grid-column:${hr + 2}` }, hr % 3 === 0 ? String(hr) : ''));
+                grid.append(h('div', { class: 'hr', style: `grid-row:${lines.length + 2};grid-column:${hr + 2}` },
+                    hr % 3 === 0 ? String(hr) : ''));
             }
+            return grid;
+        }
+
+        function heatLegend() {
             const sw = (cls, label) => h('span', null, h('i', { class: cls }), label);
-            const legend = h('div', { class: 'legend' }, h('span', null, '超過 1 秒的比例：'),
+            return h('div', { class: 'legend' }, h('span', null, '超過 1 秒的比例：'),
                 sw('h0', '0%'), sw('h1', '<5%'), sw('h2', '<10%'), sw('h3', '<20%'), sw('h4', '<35%'), sw('h5', '≥35%'),
                 sw('nod', `少於 ${MIN_CELL} 筆`));
-            return [grid, legend];
+        }
+
+        function heatmap(sum) {
+            const lines = [['你實際等待', 'page'], ['HiNet 節點補檔', 'first']].map(([label, key]) => ({
+                label: term(label, key), hours: sum.by_hour, stat: b => b[key],
+                tip: b => `${hourRange(b.hour)}　${label}\n${cellDetail(b[key])}` }));
+            return [heatGrid(lines), heatLegend()];
+        }
+
+        const WEEKDAY = '日一二三四五六';
+        const dayLabel = d => `${d.slice(5)}（${WEEKDAY[new Date(d + 'T12:00').getDay()]}）`;
+
+        // One row per local date, newest first; colored by the HiNet replay,
+        // with the page load in the tooltip.
+        function dayHeatmap(sum) {
+            const days = sum.by_day.slice(-DAY_ROWS).reverse();
+            const lines = days.map(d => ({
+                label: dayLabel(d.date), hours: d.by_hour, stat: b => b.first,
+                tip: b => `${d.date} ${hourRange(b.hour)}\nHiNet 節點補檔：${cellDetail(b.first)}\n你實際等待：${cellDetail(b.page)}` }));
+            return [heatGrid(lines), heatLegend()];
+        }
+
+        function dayTable(sum) {
+            const side = s => s.n ? `${rate(s)}（${s.n} 筆）` : '–';
+            const rows = sum.by_day.slice(-DAY_ROWS).reverse().map(d => h('tr', null,
+                h('td', null, dayLabel(d.date)), h('td', null, d.samples),
+                h('td', null, side(d.first.peak)), h('td', null, side(d.first.offpeak)),
+                h('td', null, side(d.page.peak)), h('td', null, side(d.page.offpeak))));
+            return h('table', null,
+                h('tr', null, h('th', null, '日期'), h('th', null, '筆數'),
+                    h('th', null, term('補檔', 'first'), ' ', term('尖峰', 'peak')), h('th', null, '補檔 離峰'),
+                    h('th', null, term('實際等待', 'page'), ' 尖峰'), h('th', null, '實際等待 離峰')),
+                rows);
         }
 
         function splitTable(sum) {
@@ -690,6 +743,9 @@ button.b.danger { color: var(--bad); }
                 heatmap(sum),
                 h('h2', null, '尖峰與離峰'),
                 splitTable(sum),
+                sum.by_day.length > 0 && h('h2', null, term('每天的狀況', 'days')),
+                sum.by_day.length > 0 && dayHeatmap(sum),
+                sum.by_day.length > 0 && dayTable(sum),
                 h('details', null, h('summary', null, '依圖片主機（你實際等待）'), hostTable(sum)),
                 h('details', null, h('summary', null, '依 HiNet 節點（補檔測試）'), nodeTable(sum)),
                 h('div', { class: 'btns' }, btnJson, btnCsv, btnPause, btnClear),
