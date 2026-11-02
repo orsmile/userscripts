@@ -2,7 +2,7 @@
 // @name         FNA replay
 // @name:zh-TW   Meta 圖片載入觀測
 // @namespace    gl-mt5000-tuning
-// @version      0.6.0
+// @version      0.6.1
 // @description  Replays the Meta images and videos you load against HiNet's FNA caches and logs how long a first and a repeat fetch take
 // @description:zh-TW 瀏覽 FB、IG、Threads 時，記錄圖片和影片載入要等多久，並比較尖峰與離峰時段
 // @match        https://www.facebook.com/*
@@ -63,7 +63,7 @@
     const MIN_CELL = 3;
     // Days shown in the per-day heatmap and table (the export keeps every day).
     const DAY_ROWS = 14;
-    const VERSION = '0.6.0';
+    const VERSION = '0.6.1';
     const NET_REFRESH_MS = 10 * 60000;
     // Short names for Taiwanese ASNs, from TWNIC's registry (map.twnic.tw)
     // and RIPE's AS names on 2026-11-01.  Any other ASN shows its registry
@@ -403,6 +403,22 @@
         }, null, 1);
     }
 
+    // Saves text as a file; a few thousand rows are too big to paste comfortably.
+    function download(text, ext, type) {
+        const stamp = new Date().toLocaleString('sv').slice(0, 16).replace(/[-: ]/g, '');
+        const url = URL.createObjectURL(new Blob([text], { type }));
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `fna-replay-${stamp}.${ext}`;
+        a.style.display = 'none';
+        document.body.append(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 10000);
+    }
+    const downloadJson = () => download(jsonText(GM_getValue(KEY_ROWS, [])), 'json', 'application/json');
+    const downloadCsv = () => download(csvText(GM_getValue(KEY_ROWS, [])), 'csv', 'text/csv');
+
     // ---- panel ----------------------------------------------------------
 
     const TIPS = {
@@ -422,8 +438,9 @@
         days: `每一列是一天（依你電腦的時間），格子是 HiNet 節點補檔每小時超過 1 秒的比例，滑過去也會看到你實際等待的數字。下面的表格是每天尖峰和離峰超過 1 秒的比例，括號是筆數。最多顯示最近 ${DAY_ROWS} 天。`,
         verdict: `尖峰慢的比例 10% 以上、而且是離峰的兩倍以上，算「只有尖峰會卡」。兩邊都 10% 以上算「整天都會卡」，都低於 5% 算「沒有明顯卡頓」。每邊至少要 ${MIN_VERDICT} 筆。`,
         samples: '每幾秒抽一張你剛看到的圖或影片來量，一次算一筆。只記錄時間和大小，不記錄網址或內容。',
-        json: '複製完整資料（含統計和每一筆紀錄）成 JSON，適合直接貼給 AI agent 分析。',
-        csv: '複製每一筆紀錄成 CSV（跟舊版欄位相同，多了 asn、as_name 兩欄網路資訊），可以貼進試算表或給 agent。',
+        json: '下載完整資料（含統計和每一筆紀錄）成 JSON 檔，把檔案交給 AI agent 分析。資料多時比複製貼上方便。',
+        csv: '下載每一筆紀錄成 CSV 檔（多了 asn、as_name 兩欄網路資訊），可以用試算表打開或給 agent。',
+        copy: '把同樣的 JSON 複製到剪貼簿。資料少的時候可以直接貼。',
     };
 
     const CSS = `
@@ -710,10 +727,10 @@ button.b.danger { color: var(--bad); }
                 }));
             const top = sum.page_hosts.slice(0, 3)
                 .map(p => `${p.host}${p.operator ? `（${p.operator}）` : ''} ${p.n} 筆`).join('、') || '還沒有資料';
-            const btnJson = h('button', { class: 'b primary', tip: TIPS.json,
+            const btnJson = h('button', { class: 'b primary', tip: TIPS.json, onclick: downloadJson }, '下載 JSON');
+            const btnCsv = h('button', { class: 'b', tip: TIPS.csv, onclick: downloadCsv }, '下載 CSV');
+            const btnCopy = h('button', { class: 'b', tip: TIPS.copy,
                 onclick: e => { GM_setClipboard(jsonText(GM_getValue(KEY_ROWS, []))); flash(e.target, `已複製 ${total} 筆`); } }, '複製 JSON');
-            const btnCsv = h('button', { class: 'b', tip: TIPS.csv,
-                onclick: e => { GM_setClipboard(csvText(GM_getValue(KEY_ROWS, []))); flash(e.target, `已複製 ${total} 筆`); } }, '複製 CSV');
             const btnPause = h('button', { class: 'b', onclick: () => {
                 paused = !paused; GM_setValue('paused', paused); update(GM_getValue(KEY_ROWS, []));
             } }, paused ? '繼續記錄' : '暫停記錄');
@@ -748,7 +765,7 @@ button.b.danger { color: var(--bad); }
                 sum.by_day.length > 0 && dayTable(sum),
                 h('details', null, h('summary', null, '依圖片主機（你實際等待）'), hostTable(sum)),
                 h('details', null, h('summary', null, '依 HiNet 節點（補檔測試）'), nodeTable(sum)),
-                h('div', { class: 'btns' }, btnJson, btnCsv, btnPause, btnClear),
+                h('div', { class: 'btns' }, btnJson, btnCsv, btnCopy, btnPause, btnClear),
                 h('div', { class: 'foot' }, `只記錄時間、大小和狀態碼，不記錄網址或內容。資料只存在這台電腦的 Tampermonkey 裡，最多 ${MAX_ROWS / 4} 筆。`));
         }
 
@@ -769,8 +786,9 @@ button.b.danger { color: var(--bad); }
     })();
 
     GM_registerMenuCommand('開啟面板 / Open panel', () => ui.toggle());
+    GM_registerMenuCommand('下載 JSON / Download JSON', downloadJson);
+    GM_registerMenuCommand('下載 CSV / Download CSV', downloadCsv);
     GM_registerMenuCommand('複製 JSON / Copy JSON', () => GM_setClipboard(jsonText(GM_getValue(KEY_ROWS, []))));
-    GM_registerMenuCommand('複製 CSV / Copy CSV', () => GM_setClipboard(csvText(GM_getValue(KEY_ROWS, []))));
 
     if (document.body) ui.mount();
     else document.addEventListener('DOMContentLoaded', () => ui.mount());
